@@ -1,4 +1,3 @@
-
 from scrapy import signals
 from itemadapter import ItemAdapter
 

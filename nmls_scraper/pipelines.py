@@ -1,13 +1,10 @@
-
-
 import psycopg2
 import logging
 from scrapy.exceptions import DropItem
-
-from nmls_scraper.items import obyavlenie, image, phone
+from nmls_scraper.items import AdvertItem, ImageItem, PhoneItem
 
 class NmlsScraperPipeline:
-    
+
     schema_name = 'data'
     advt_table = 'advt'
     images_table = 'images'
@@ -29,13 +26,13 @@ class NmlsScraperPipeline:
         try:
             self.connection = psycopg2.connect(**self.db_settings)
             self.cursor = self.connection.cursor()
-            
+
             self.cursor.execute(f'SET search_path TO {self.schema_name}, public;')
-            self.connection.commit() 
+            self.connection.commit()
             logging.info(f"Успешно подключено к базе данных. Установлен search_path на '{self.schema_name}'.")
         except psycopg2.Error as e:
             logging.error(f"Ошибка подключения к базе данных: {e}")
-            
+
             raise DropItem(f"Ошибка подключения к БД: {e}")
 
 
@@ -44,7 +41,7 @@ class NmlsScraperPipeline:
             self.cursor.close()
         if self.connection:
             self.connection.close()
-            logging.info("Соединение с базой данных закрыто")
+            logging.info("Соединение с базой данных закрыто.")
 
     def process_item(self, item, spider):
         if not self.connection or not self.cursor:
@@ -52,29 +49,28 @@ class NmlsScraperPipeline:
              return item
 
         try:
-            if isinstance(item, obyavlenie):
+            if isinstance(item, AdvertItem):
                 self.insert_or_update_advt(item)
-            elif isinstance(item, image):
+            elif isinstance(item, ImageItem):
                 self.insert_image(item)
-            elif isinstance(item, phone):
+            elif isinstance(item, PhoneItem):
                 self.insert_phone_number(item)
             else:
                 logging.warning(f"Неизвестный тип Item: {type(item).__name__}")
 
         except psycopg2.Error as e:
-             
+
              if self.connection:
-                 self.connection.rollback() 
+                 self.connection.rollback()
              logging.error(f"Ошибка БД при сохранении Item типа {type(item).__name__} ({item.get('id') or item.get('advt_id')}): {e}", exc_info=True)
-             
-             
+
 
         except Exception as e:
-             
+
              if self.connection:
                  self.connection.rollback()
              logging.error(f"Неожиданная ошибка при обработке Item типа {type(item).__name__}: {e}", exc_info=True)
-             
+
 
         return item
 
@@ -108,14 +104,14 @@ class NmlsScraperPipeline:
             item.get('is_company'), item.get('contactname'), item.get('company'), item.get('region'),
             item.get('city'), item.get('address'), item.get('description'), item.get('advt_type'),
             item.get('source'), item.get('cat'), item.get('lat'), item.get('lon'),
-            item.get('params'), 
+            item.get('params'),
             item.get('date_posted'), item.get('is_active'),
         ))
         self.connection.commit()
-        
+
 
     def insert_image(self, item):
-        
+
         sql = f"""
         INSERT INTO {self.images_table} (advt_id, url, date_update)
         VALUES (%s, %s, %s)
@@ -126,7 +122,7 @@ class NmlsScraperPipeline:
             item.get('advt_id'), item.get('url'), item.get('date_update'),
         ))
         self.connection.commit()
-        
+
 
     def insert_phone_number(self, item):
         sql = f"""
@@ -141,4 +137,3 @@ class NmlsScraperPipeline:
             item.get('advt_id'), phone_value, item.get('is_fake'), item.get('date_update'),
         ))
         self.connection.commit()
-        
