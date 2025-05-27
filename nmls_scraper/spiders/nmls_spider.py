@@ -19,7 +19,6 @@ class NmlsSpider(scrapy.Spider):
         specific_subdomain = settings.get('SPECIFIC_REGION_SUBDOMAIN')
 
         if crawl_specific and specific_subdomain:
-            # Если включен парсинг конкретного региона
             region_url = f'https://{specific_subdomain}.nmls.ru/'
             self.logger.info(f"Парсинг только региона: {specific_subdomain}. Начальный URL: {region_url}")
             yield scrapy.Request(url=region_url, callback=self.parse_region_home)
@@ -27,7 +26,7 @@ class NmlsSpider(scrapy.Spider):
             self.logger.info("Парсинг всех регионов. Начальный URL: https://nmls.ru/")
             yield scrapy.Request(url='https://nmls.ru/', callback=self.parse_regions)
 
-    # Сопоставление URL-сегментов и ID категорий/типов
+
     CAT_MAP = {
         'kvartir': 1, 'komnat': 2, 'domov': 3, 'zemelnyh-uchastkov': 4,
         'garazhey': 5, 'kommercheskoy-nedvizhimosti': 6,
@@ -51,27 +50,31 @@ class NmlsSpider(scrapy.Spider):
                 if domain.startswith('www.'):
                     domain = domain[4:]
 
-                if domain and domain not in seen_domains:
-                    seen_domains.add(domain)
-                    region_url = f'{parsed_u.scheme}://{domain}/'
-                    self.logger.info(f"Найден домен: {domain}. Переход на {region_url}")
-                    yield response.follow(region_url, self.parse_region_home)
+                if not domain or domain in seen_domains:
+                    self.logger.debug(f"Пропуск домена (пустой или уже виден): {domain} для ссылки {link}")
+                    continue
+
+                seen_domains.add(domain)
+                region_url = f'{parsed_u.scheme}://{domain}/'
+                self.logger.info(f"Найден домен: {domain}. Переход на {region_url}")
+                yield response.follow(region_url, self.parse_region_home)
             except Exception as e:
                  self.logger.error(f"Ошибка ссылки региона '{link}': {e}")
 
     def parse_region_home(self, response):
         self.logger.info(f"Домашняя региона: {response.url}")
+
         section_urls = response.xpath(
             '//div[contains(@class, "realty-filter")]//a[contains(@class, "btn-category")]/@href'
         ).getall()
+
         if not section_urls:
             self.logger.warning(f"Нет ссылок в блоке realty-filter на {response.url}. Попытка поиска в навбаре.")
             section_urls = response.xpath('//nav[@class="navbar"]//a[contains(@class, "dropdown-item")]/@href').getall()
 
-
         if not section_urls:
              self.logger.warning(f"Нет ссылок разделов на {response.url} (ни в realty-filter, ни в навбаре).")
-             return 
+             return
 
         for link in section_urls:
             full_url = response.urljoin(link)
@@ -79,24 +82,28 @@ class NmlsSpider(scrapy.Spider):
             path = parsed_u.path
 
             match = self.PATH_SEG_RE.search(path)
-            if match:
-                advt_type_seg = match.group(1)
-                cat_seg = match.group(2)
+            # Уменьшение вложенности
+            if not match:
+                self.logger.debug(f"Пропуск ссылки (неверный формат пути): {full_url}")
+                continue
 
-                advt_type_id = self.ADVT_MAP.get(advt_type_seg)
-                cat_id = self.CAT_MAP.get(cat_seg)
+            advt_type_seg = match.group(1)
+            cat_seg = match.group(2)
 
-                if advt_type_id is not None and cat_id is not None:
-                    self.logger.info(f"Раздел: {full_url}, тип={advt_type_id}, кат={cat_id}")
-                    yield response.follow(
-                        full_url,
-                        self.parse_listing_page,
-                        meta={'cat_id': cat_id, 'advt_type_id': advt_type_id}
-                    )
-                else:
-                    self.logger.debug(f"Пропуск ссылки (неизвестный тип/кат): {full_url}")
-            else:
-                 self.logger.debug(f"Пропуск ссылки (формат пути): {full_url}")
+            advt_type_id = self.ADVT_MAP.get(advt_type_seg)
+            cat_id = self.CAT_MAP.get(cat_seg)
+
+            # Уменьшение вложенности
+            if advt_type_id is None or cat_id is None:
+                self.logger.debug(f"Пропуск ссылки (неизвестный тип/кат): {full_url}")
+                continue
+
+            self.logger.info(f"Раздел: {full_url}, тип={advt_type_id}, кат={cat_id}")
+            yield response.follow(
+                full_url,
+                self.parse_listing_page,
+                meta={'cat_id': cat_id, 'advt_type_id': advt_type_id}
+            )
 
     def parse_listing_page(self, response):
         cat_id = response.meta.get('cat_id')
@@ -108,8 +115,6 @@ class NmlsSpider(scrapy.Spider):
 
         self.logger.info(f"Список: {response.url}")
 
-        # Ссылки на объявления
-        # заменил .css на .xpath
         ad_urls = response.xpath('//div[contains(@class, "listing-item")]/a[contains(@href, "/id")]/@href').getall()
         if not ad_urls:
              ad_urls = response.xpath('//a[contains(@href, "/id")]/@href').getall()
@@ -119,17 +124,16 @@ class NmlsSpider(scrapy.Spider):
 
         for link in ad_urls:
             full_url = response.urljoin(link)
-            if re.search(r'/id\d+$', full_url):
-                 yield response.follow(
-                     full_url,
-                     self.parse_detail_page,
-                     meta={'cat_id': cat_id, 'advt_type_id': advt_type_id}
-                 )
-            else:
+            if not re.search(r'/id\d+$', full_url):
                  self.logger.debug(f"Пропуск ссылки (не объявление): {link}")
+                 continue
 
-        # Пагинация
-        # заменил .css на .xpath
+            yield response.follow(
+                full_url,
+                self.parse_detail_page,
+                meta={'cat_id': cat_id, 'advt_type_id': advt_type_id}
+            )
+
         next_url = response.xpath('//a[@rel="next"]/@href').get()
         if not next_url:
              next_page_indicator = response.xpath('//a[contains(@class, "page-link")]/span[@aria-hidden="true"]/text()').re_first(r'›')
@@ -159,10 +163,8 @@ class NmlsSpider(scrapy.Spider):
 
         self.logger.info(f"Объявление: {item['url']}")
 
-        # заменил .css на .xpath
         item['title'] = ''.join(response.xpath('//h1//text()').getall()).strip() if response.xpath('//h1//text()').getall() else None
 
-        # заменил .css на .xpath
         price_text = response.xpath('//div[contains(@class, "card-price")]/text()').get()
         if price_text:
             cleaned_price = re.sub(r'\D', '', price_text)
@@ -175,24 +177,18 @@ class NmlsSpider(scrapy.Spider):
             item['price'] = 0
 
         # Контакты
-        # заменил .css на .xpath
         contacts_block = response.xpath('//div[contains(@class, "object-infoblock") and contains(@class, "object-contacts")]')
-
         item['is_company'] = False
         item['contactname'] = None
         item['company'] = None
-        phones_set = set() # Изменили список на set для автоматической уникальности
+        phones_set = set()
 
-        # заменил .css на .xpath (относительно contacts_block)
-        if contacts_block and contacts_block.xpath('./noindex').get() is None:
-             self.logger.debug(f"Контакты видимы для {response.url}")
-
-             # заменил .css на .xpath (относительно contacts_block)
+        if not contacts_block or contacts_block.xpath('./noindex').get() is not None:
+             self.logger.debug(f"Контакты скрыты/нет для {response.url}")
+        else:
              contact_person = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').get()
              if contact_person:
                   item['contactname'] = contact_person.strip()
-
-             # заменил .css на .xpath (относительно contacts_block)
              company_text_lines = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').getall()
              company_org_name = None
              for line in company_text_lines:
@@ -209,20 +205,15 @@ class NmlsSpider(scrapy.Spider):
                  item['is_company'] = False
 
              # Сбор телефонов
-             # заменил .css на .xpath (относительно contacts_block)
              phone_hrefs = contacts_block.xpath('.//a[starts-with(@href, "tel:")]/@href').getall()
              for phone_href_raw in phone_hrefs:
-                 # Упростил регулярное выражение
                  phone_digits = re.sub(r'\D', '', phone_href_raw)
-                 if len(phone_digits) == 11 and phone_digits.startswith('7'):
-                     phones_set.add(phone_digits) 
-                 else:
+                 if not (len(phone_digits) == 11 and phone_digits.startswith('7')):
                       self.logger.debug(f"Телефон '{phone_href_raw}' неформат для {response.url}")
-        else:
-            self.logger.debug(f"Контакты скрыты/нет для {response.url}")
+                      continue
+                 phones_set.add(phone_digits)
 
         # Регион, Город
-        # заменил .css на .xpath
         reg_city_text = response.xpath('//div[contains(@class, "header")]//div[contains(@class, "region")]/a/text()').get()
         if reg_city_text:
             reg_city_text = reg_city_text.strip()
@@ -240,7 +231,7 @@ class NmlsSpider(scrapy.Spider):
              item['city'] = 'Не указан'
              item['region'] = 'Не указан'
 
-
+        # Адрес
         address_parts = response.xpath('//table[@class="object_info"]//td[text()="Адрес"]/following-sibling::td//text()').getall()
         if address_parts:
             full_address = ' '.join([p.strip() for p in address_parts if p.strip()]).strip()
@@ -253,11 +244,10 @@ class NmlsSpider(scrapy.Spider):
              item['address'] = 'Не указан'
 
         # Описание
-        # заменил .css на .xpath
         desc_block = response.xpath('//div[contains(@class, "object-infoblock")]/div[contains(@class, "descr")]')
         if desc_block:
-            # заменил .css на .xpath (относительно desc_block)
             desc_paragraphs = desc_block.xpath('./p/text()').getall()
+            # Вложенность здесь минимальна.
             if desc_paragraphs:
                  desc_text = ' '.join([p.strip() for p in desc_paragraphs if p.strip()]).strip()
                  item['description'] = re.sub(r'\s+', ' ', desc_text).strip()
@@ -271,7 +261,6 @@ class NmlsSpider(scrapy.Spider):
         item['cat'] = cat_id
 
         # Координаты
-        # заменил .css на .xpath
         lat_text = response.xpath('//div[@id="objectMap"]/@data-lat').get()
         lon_text = response.xpath('//div[@id="objectMap"]/@data-lng').get()
         try:
@@ -285,69 +274,65 @@ class NmlsSpider(scrapy.Spider):
         # Параметры (jsonb)
         params_data = {}
         for row in response.xpath('//table[@class="object_info"]/tbody/tr'):
-             tds = row.xpath('./td')
-             if len(tds) < 2:
-                 continue
-             k_td = tds[0]
-             v_td = tds[1]
+            tds = row.xpath('./td')
+            if len(tds) < 2:
+                continue
 
-             k_text = k_td.xpath('.//text()').get()
-             if not k_text:
-                 continue
+            k_td = tds[0]
+            v_td = tds[1]
 
-             key = k_text.strip()
+            k_text = k_td.xpath('.//text()').get()
+            if not k_text:
+                continue
 
-             if key == 'Адрес': continue
-             elif key == 'Площадь (кв.м.)':
-                 # заменил .css на .xpath 
-                 area_values = v_td.xpath('./span[contains(@class, "d-none")]/text()').get()
-                 if area_values:
-                     params_data[key] = area_values.strip()
-                 else:
-                     # заменил .css на .xpath 
-                     area_parts_raw = v_td.xpath('./span[contains(@class, "d-block") and contains(@class, "d-md-inline")]/string()').getall()
-                     area_parts = [p.strip() for p in area_parts_raw if p.strip()]
-                     params_data[key] = ' '.join(area_parts) if area_parts else ' '.join(v_td.xpath('.//text()').getall()).strip()
-             else:
-                 v_parts = v_td.xpath('.//text()').getall()
-                 value = ''.join(v_parts).strip()
-                 value = re.sub(r'\s*–.*', '', value).strip()
-                 value = re.sub(r'\s+', ' ', value).strip()
-                 if value:
-                    params_data[key] = value
+            key = k_text.strip()
+
+            if key == 'Адрес':
+                continue 
+            elif key == 'Площадь (кв.м.)':
+                area_values = v_td.xpath('./span[contains(@class, "d-none")]/text()').get()
+                if area_values:
+                    params_data[key] = area_values.strip()
+                else:
+                    area_parts_raw = v_td.xpath('./span[contains(@class, "d-block") and contains(@class, "d-md-inline")]/string()').getall()
+                    area_parts = [p.strip() for p in area_parts_raw if p.strip()]
+                    params_data[key] = ' '.join(area_parts) if area_parts else ' '.join(v_td.xpath('.//text()').getall()).strip()
+            else:
+                v_parts = v_td.xpath('.//text()').getall()
+                value = ''.join(v_parts).strip()
+                value = re.sub(r'\s*–.*', '', value).strip()
+                value = re.sub(r'\s+', ' ', value).strip()
+                if value:
+                   params_data[key] = value
 
         item['params'] = json.dumps(params_data, ensure_ascii=False)
 
         # Дата публикации
-        # заменил .css на .xpath
         date_text = response.xpath(
             '//div[contains(@class, "object-header")]/span[contains(@style, "font-size")]/text() | '
             '//div[contains(@class, "object-header")]/span[contains(@class, "text-muted")]/text()'
         ).get()
 
-        # Перенесли логику парсинга даты в отдельную функцию в utils.py
         item['date_posted'] = parse_date_string(date_text, logger=self.logger)
-
 
         yield item
 
         # Сбор изображений
-        # заменил .css на .xpath
         image_urls_list = response.xpath('//div[contains(@class, "fotorama")]/a/@href').getall()
         if not image_urls_list:
              self.logger.debug(f"Нет картинок для {item['id']}")
 
         for img_url_raw in image_urls_list:
-            img_item = ImageItem() 
+            img_item = ImageItem()
             img_item['advt_id'] = item['id']
             img_item['url'] = response.urljoin(img_url_raw)
             img_item['date_update'] = datetime.datetime.now()
             yield img_item
 
         # Сбор телефонов
-        if phones_set: # Теперь используем set
+        if phones_set:
              for phone_digits in phones_set:
-                 phone_item = PhoneItem() 
+                 phone_item = PhoneItem()
                  phone_item['advt_id'] = item['id']
                  try:
                       phone_item['phone'] = int(phone_digits)
