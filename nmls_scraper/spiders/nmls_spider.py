@@ -82,7 +82,6 @@ class NmlsSpider(scrapy.Spider):
             path = parsed_u.path
 
             match = self.PATH_SEG_RE.search(path)
-            # Уменьшение вложенности
             if not match:
                 self.logger.debug(f"Пропуск ссылки (неверный формат пути): {full_url}")
                 continue
@@ -93,7 +92,6 @@ class NmlsSpider(scrapy.Spider):
             advt_type_id = self.ADVT_MAP.get(advt_type_seg)
             cat_id = self.CAT_MAP.get(cat_seg)
 
-            # Уменьшение вложенности
             if advt_type_id is None or cat_id is None:
                 self.logger.debug(f"Пропуск ссылки (неизвестный тип/кат): {full_url}")
                 continue
@@ -163,7 +161,7 @@ class NmlsSpider(scrapy.Spider):
 
         self.logger.info(f"Объявление: {item['url']}")
 
-        item['title'] = ''.join(response.xpath('//h1//text()').getall()).strip() if response.xpath('//h1//text()').getall() else None
+        item['title'] = ''.join(response.xpath('//h1//text()').getall()).strip() or None
 
         price_text = response.xpath('//div[contains(@class, "card-price")]/text()').get()
         if price_text:
@@ -174,7 +172,7 @@ class NmlsSpider(scrapy.Spider):
                 self.logger.warning(f"Цена '{price_text}' не число для {response.url}")
                 item['price'] = 0
         else:
-            item['price'] = 0
+            item['price'] = 0 
 
         # Контакты
         contacts_block = response.xpath('//div[contains(@class, "object-infoblock") and contains(@class, "object-contacts")]')
@@ -187,8 +185,8 @@ class NmlsSpider(scrapy.Spider):
              self.logger.debug(f"Контакты скрыты/нет для {response.url}")
         else:
              contact_person = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').get()
-             if contact_person:
-                  item['contactname'] = contact_person.strip()
+             if contact_person: # Если contact_person пустая строка, она станет None
+                  item['contactname'] = contact_person.strip() or None
              company_text_lines = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').getall()
              company_org_name = None
              for line in company_text_lines:
@@ -198,10 +196,10 @@ class NmlsSpider(scrapy.Spider):
 
              if company_org_name:
                   item['is_company'] = True
-                  item['company'] = company_org_name
+                  item['company'] = company_org_name or None # Если company_org_name пустая строка
                   if item['contactname'] is None:
-                       item['contactname'] = company_org_name
-             elif item['contactname']:
+                       item['contactname'] = company_org_name or None
+             elif item['contactname']: # Проверка, что contactname не None
                  item['is_company'] = False
 
              # Сбор телефонов
@@ -215,52 +213,48 @@ class NmlsSpider(scrapy.Spider):
 
         # Регион, Город
         reg_city_text = response.xpath('//div[contains(@class, "header")]//div[contains(@class, "region")]/a/text()').get()
+        item['city'] = None # Устанавливаем None по умолчанию
+        item['region'] = None # Устанавливаем None по умолчанию
+
         if reg_city_text:
             reg_city_text = reg_city_text.strip()
             parts = [p.strip() for p in re.split(r' и |, ', reg_city_text) if p.strip()]
             if len(parts) > 1:
-                 item['city'] = parts[0]
-                 item['region'] = parts[-1]
+                 item['city'] = parts[0] or None
+                 item['region'] = parts[-1] or None
             elif parts:
-                 item['city'] = parts[0]
-                 item['region'] = parts[0]
-            else:
-                 item['city'] = 'Не указан'
-                 item['region'] = 'Не указан'
-        else:
-             item['city'] = 'Не указан'
-             item['region'] = 'Не указан'
+                 item['city'] = parts[0] or None
+                 item['region'] = parts[0] or None
 
         # Адрес
         address_parts = response.xpath('//table[@class="object_info"]//td[text()="Адрес"]/following-sibling::td//text()').getall()
+        item['address'] = None # Устанавливаем None по умолчанию
+
         if address_parts:
             full_address = ' '.join([p.strip() for p in address_parts if p.strip()]).strip()
             full_address = re.sub(r'\s+', ' ', full_address).strip()
             full_address = re.sub(r'\s*,', ',', full_address)
             full_address = re.sub(r',+', ',', full_address)
             full_address = full_address.strip(', ')
-            item['address'] = full_address if full_address else 'Не указан'
-        else:
-             item['address'] = 'Не указан'
+            item['address'] = full_address or None # Если full_address пустая строка, станет None
 
         # Описание
         desc_block = response.xpath('//div[contains(@class, "object-infoblock")]/div[contains(@class, "descr")]')
+        item['description'] = None # Устанавливаем None по умолчанию
+
         if desc_block:
             desc_paragraphs = desc_block.xpath('./p/text()').getall()
-            # Вложенность здесь минимальна.
             if desc_paragraphs:
                  desc_text = ' '.join([p.strip() for p in desc_paragraphs if p.strip()]).strip()
-                 item['description'] = re.sub(r'\s+', ' ', desc_text).strip()
+                 item['description'] = re.sub(r'\s+', ' ', desc_text).strip() or None
             else:
                  desc_text = ' '.join(desc_block.xpath('.//text()').getall()).strip()
-                 item['description'] = re.sub(r'\s+', ' ', desc_text).strip() if desc_text else 'Нет описания'
-        else:
-             item['description'] = 'Нет описания'
+                 item['description'] = re.sub(r'\s+', ' ', desc_text).strip() or None
 
         item['advt_type'] = advt_type_id
         item['cat'] = cat_id
 
-        # Координаты
+        # Координаты 
         lat_text = response.xpath('//div[@id="objectMap"]/@data-lat').get()
         lon_text = response.xpath('//div[@id="objectMap"]/@data-lng').get()
         try:
@@ -291,23 +285,17 @@ class NmlsSpider(scrapy.Spider):
                 continue 
             elif key == 'Площадь (кв.м.)':
                 area_values = v_td.xpath('./span[contains(@class, "d-none")]/text()').get()
-                if area_values:
-                    params_data[key] = area_values.strip()
-                else:
-                    area_parts_raw = v_td.xpath('./span[contains(@class, "d-block") and contains(@class, "d-md-inline")]/string()').getall()
-                    area_parts = [p.strip() for p in area_parts_raw if p.strip()]
-                    params_data[key] = ' '.join(area_parts) if area_parts else ' '.join(v_td.xpath('.//text()').getall()).strip()
+                params_data[key] = area_values.strip() if area_values else None
             else:
                 v_parts = v_td.xpath('.//text()').getall()
                 value = ''.join(v_parts).strip()
                 value = re.sub(r'\s*–.*', '', value).strip()
                 value = re.sub(r'\s+', ' ', value).strip()
-                if value:
-                   params_data[key] = value
+                params_data[key] = value or None # Если value пустая строка, станет None
 
         item['params'] = json.dumps(params_data, ensure_ascii=False)
 
-        # Дата публикации
+        # Дата публикации (parse_date_string возвращает None, если не распознает)
         date_text = response.xpath(
             '//div[contains(@class, "object-header")]/span[contains(@style, "font-size")]/text() | '
             '//div[contains(@class, "object-header")]/span[contains(@class, "text-muted")]/text()'
