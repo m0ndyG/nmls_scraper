@@ -26,7 +26,6 @@ class NmlsSpider(scrapy.Spider):
             self.logger.info("парсинг всех регионов. начальный url: https://nmls.ru/")
             yield scrapy.Request(url='https://nmls.ru/', callback=self.parse_regions)
 
-
     CAT_MAP = {
         'kvartir': 1, 'komnat': 2, 'domov': 3, 'zemelnyh-uchastkov': 4,
         'garazhey': 5, 'kommercheskoy-nedvizhimosti': 6,
@@ -56,15 +55,13 @@ class NmlsSpider(scrapy.Spider):
                 seen_domains.add(domain)
                 region_url = f'{parsed_u.scheme}://{domain}/'
                 self.logger.info(f"найден домен: {domain}. переход на {region_url}")
-                #   передаем домен как идентификатор региона для статистики
                 yield scrapy.Request(region_url, self.parse_region_home, meta={'region_domain': domain.split('.')[0]})
             except Exception as e:
-                 self.logger.error(f"ошибка ссылки региона '{link}': {e}")
+                 self.logger.error(f"ошибка при обработке ссылки региона '{link}': {e}")
 
     def parse_region_home(self, response):
-        #   получаем домен региона из meta, если есть. иначе из url.
         region_domain = response.meta.get('region_domain', urlparse(response.url).netloc.split('.')[0])
-        self.logger.info(f"домашняя региона: {response.url} (регион: {region_domain})")
+        self.logger.info(f"домашняя страница региона: {response.url} (регион: {region_domain})")
 
         section_urls = response.xpath(
             '//div[contains(@class, "realty-filter")]//a[contains(@class, "btn-category")]/@href'
@@ -95,89 +92,103 @@ class NmlsSpider(scrapy.Spider):
             cat_id = self.CAT_MAP.get(cat_seg)
 
             if advt_type_id is None or cat_id is None:
-                self.logger.debug(f"пропуск ссылки (неизвестный тип/кат): {full_url}")
+                self.logger.debug(f"пропуск ссылки (неизвестный тип/категория): {full_url}")
                 continue
-
-            self.logger.info(f"раздел: {full_url}, тип={advt_type_id}, кат={cat_id}")
-            #   передаем region_domain, чтобы использовать его в parse_listing_page для статистики
+            
+            # теперь parse_category_pages будет определять последнюю страницу и генерировать запросы
+            self.logger.info(f"обработка категории: {full_url}, тип={advt_type_id}, кат={cat_id}")
             yield scrapy.Request(
                 full_url,
+                self.parse_category_pages, # новый метод для определения страниц пагинации
+                meta={
+                    'cat_id': cat_id,
+                    'advt_type_id': advt_type_id,
+                    'region_domain': region_domain # передаем дальше
+                }
+            )
+
+    def parse_category_pages(self, response):
+        # этот метод отвечает за определение всех страниц в категории
+        cat_id = response.meta.get('cat_id')
+        advt_type_id = response.meta.get('advt_type_id')
+        region_domain = response.meta.get('region_domain', 'unknown_region')
+
+        self.logger.info(f"определение страниц пагинации для: {response.url}")
+
+        last_page_num = 1
+        # 1. ищем ссылку на последнюю страницу, используя класс nav-last
+        last_page_link = response.xpath("//a[@class='nav-last']/@href").get()
+        if last_page_link:
+            last_page_match = re.search(r'page=(\d+)', last_page_link)
+            if last_page_match:
+                last_page_num = int(last_page_match.group(1))
+        
+        # 2. если nav-last нет, ищем максимальный номер страницы в других ссылках пагинации
+        if last_page_num == 1: # только если nav-last не дал результата
+            page_links = response.xpath("//a[contains(@href, 'page=')]/@href").getall()
+            for plink in page_links:
+                page_match = re.search(r'page=(\d+)', plink)
+                if page_match:
+                    last_page_num = max(last_page_num, int(page_match.group(1)))
+
+        # 3. если все еще 1, то это может быть единственная страница или пагинации нет
+        if last_page_num == 1:
+            self.logger.info(f"найдена 1 страница для {response.url}. парсим только ее.")
+            # парсим первую (и единственную) страницу
+            yield scrapy.Request(
+                response.url,
                 self.parse_listing_page,
                 meta={
                     'cat_id': cat_id,
                     'advt_type_id': advt_type_id,
-                    'initial_category_page': True,
-                    'region_domain': region_domain 
+                    'current_page': 1,
+                    'total_pages': 1,
+                    'region_domain': region_domain
                 }
             )
+        else:
+            # инкрементируем счетчик категорий, для которых сгенерировали все страницы
+            self.crawler.stats.inc_value(f'categories_full_pagination_generated/{region_domain}')
+            self.logger.info(f"найдена последняя страница: {last_page_num}. генерируем запросы для всех {last_page_num} страниц.")
+            
+            parsed_url = urlparse(response.url)
+            # строим базовый URL без параметров запроса, оставляя только путь
+            base_url_parts = parsed_url._replace(query='', fragment='') # убираем query и fragment
+
+            for page_num in range(1, last_page_num + 1):
+                params = {'page': page_num}
+                new_query = urlencode(params)
+                full_page_url = urlunparse(base_url_parts._replace(query=new_query))
+                
+                yield scrapy.Request(
+                    full_page_url,
+                    self.parse_listing_page,
+                    meta={
+                        'cat_id': cat_id,
+                        'advt_type_id': advt_type_id,
+                        'current_page': page_num, 
+                        'total_pages': last_page_num,
+                        'region_domain': region_domain 
+                    }
+                )
 
     def parse_listing_page(self, response):
         cat_id = response.meta.get('cat_id')
         advt_type_id = response.meta.get('advt_type_id')
         current_page_num = response.meta.get('current_page', 1)
-        all_pages_generated = response.meta.get('all_pages_generated', False)
-        total_pages = response.meta.get('total_pages', 'N/A') 
-        region_domain = response.meta.get('region_domain', 'unknown_region') 
+        total_pages = response.meta.get('total_pages', 'N/A')
+        region_domain = response.meta.get('region_domain', 'unknown_region')
 
         if cat_id is None or advt_type_id is None:
-             self.logger.error(f"нет cat_id/advt_type_id для {response.url}")
+             self.logger.error(f"отсутствует cat_id/advt_type_id для {response.url}")
              return
 
-        #   инкрементируем счетчик страниц для региона
+        # инкрементируем счетчик страниц для региона
         self.crawler.stats.inc_value(f'pages_crawled_by_region/{region_domain}')
         self.crawler.stats.inc_value('total_pages_crawled')
 
         self.logger.info(f"парсим страницу списка объявлений: {response.url} (страница: {current_page_num} из {total_pages})")
-
-        #   логика пагинации по последней странице
-        if not all_pages_generated:
-            # ищем ссылку на последнюю страницу, используя класс nav-last
-            last_page_link = response.xpath("//a[@class='nav-last']/@href").get()
-            last_page_num = 1
-            
-            # если ссылки на последнюю страницу нет, но есть rel="next", ищем max page number в других ссылках
-            if not last_page_link:
-                page_links = response.xpath("//a[contains(@href, 'page=')]/@href").getall()
-                for plink in page_links:
-                    page_match = re.search(r'page=(\d+)', plink)
-                    if page_match:
-                        last_page_num = max(last_page_num, int(page_match.group(1)))
-            
-            elif last_page_link:
-                last_page_match = re.search(r'page=(\d+)', last_page_link)
-                if last_page_match:
-                    last_page_num = int(last_page_match.group(1))
-
-            # если нашли больше одной страницы, генерируем все
-            if last_page_num > 1:
-                parsed_url = urlparse(response.url)
-                base_url = urlunparse(parsed_url._replace(query=""))
-
-                self.logger.info(f"найдена последняя страница ({last_page_num}). генерируем запросы для всех страниц в этой категории.")
-                #   инкрементируем счетчик категорий, для которых сгенерировали все страницы
-                self.crawler.stats.inc_value(f'categories_full_pagination_generated/{region_domain}')
-                
-                for page_num in range(1, last_page_num + 1):
-                    params = {'page': page_num}
-                    new_query = urlencode(params)
-                    full_page_url = urlunparse(parsed_url._replace(query=new_query))
-                    
-                    yield scrapy.Request(
-                        full_page_url,
-                        self.parse_listing_page,
-                        meta={
-                            'cat_id': cat_id,
-                            'advt_type_id': advt_type_id,
-                            'all_pages_generated': True, 
-                            'current_page': page_num,
-                            'total_pages': last_page_num, 
-                            'region_domain': region_domain 
-                        }
-                    )
-                return # после генерации всех страниц, текущую обработку прекращаем
-
-        # Если пагинация уже сгенерирована или это первая страница без явной "последней страницы"
-        # парсим текущую страницу
+        
         ad_urls = response.xpath('//div[contains(@class, "object-title")]/a/@href').getall()
 
         if not ad_urls:
@@ -194,38 +205,13 @@ class NmlsSpider(scrapy.Spider):
             yield scrapy.Request(
                 full_url,
                 self.parse_detail_page,
-                meta={'cat_id': cat_id, 'advt_type_id': advt_type_id, 'region_domain': region_domain} #   передаем region_domain
+                meta={'cat_id': cat_id, 'advt_type_id': advt_type_id, 'region_domain': region_domain}
             )
-
-        # если пагинация по "последней странице" не сработала, то используем старую логику "следующая"
-        if not all_pages_generated:
-            next_url = response.xpath('//a[@rel="next"]/@href').get()
-            if not next_url:
-                next_page_indicator = response.xpath('//a[contains(@class, "page-link")]/span[@aria-hidden="true"]/text()').re_first(r'›')
-                if next_page_indicator:
-                    next_url = response.xpath('//a[contains(@class, "page-link") and contains(span[@aria-hidden="true"], "›")]/@href').get()
-
-            if next_url:
-                self.logger.info(f"след. страница: {next_url}")
-                yield scrapy.Request(
-                    next_url,
-                    self.parse_listing_page,
-                    meta={
-                        'cat_id': cat_id,
-                        'advt_type_id': advt_type_id,
-                        'current_page': current_page_num + 1,
-                        'total_pages': total_pages, # передаем текущее значение total_pages
-                        'region_domain': region_domain # передаем дальше
-                    }
-                )
-            else:
-                 self.logger.info(f"конец пагинации на {response.url}")
-
 
     def parse_detail_page(self, response):
         cat_id = response.meta.get('cat_id')
         advt_type_id = response.meta.get('advt_type_id')
-        region_domain = response.meta.get('region_domain', 'unknown_region') #   получаем регион для статистики
+        region_domain = response.meta.get('region_domain', 'unknown_region')
 
         item = AdvertItem()
         item['url'] = response.url
@@ -234,8 +220,7 @@ class NmlsSpider(scrapy.Spider):
         item['source'] = 8
         item['is_active'] = True
 
-        #   логируем URL и ID объявления
-        self.logger.info(f"парсим объявление: {item['url']} (id: {item['id']})")
+        self.logger.info(f"парсим объявление: {item['url']} (ID: {item['id']})")
 
         item['title'] = ''.join(response.xpath('//h1//text()').getall()).strip() or None
 
@@ -245,7 +230,7 @@ class NmlsSpider(scrapy.Spider):
             try:
                 item['price'] = int(cleaned_price) if cleaned_price else 0
             except ValueError:
-                self.logger.warning(f"цена '{price_text}' не число для {response.url}")
+                self.logger.warning(f"цена '{price_text}' не является числом для {response.url}")
                 item['price'] = 0
         else:
             item['price'] = 0 
@@ -258,24 +243,25 @@ class NmlsSpider(scrapy.Spider):
         phones_set = set()
 
         if not contacts_block or contacts_block.xpath('./noindex').get() is not None:
-             self.logger.debug(f"контакты скрыты/нет для {response.url}")
+             self.logger.debug(f"контакты скрыты/отсутствуют для {response.url}")
         else:
-             contact_person = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').get()
-             if contact_person:
-                  item['contactname'] = contact_person.strip() or None
+             # используем .get('') для получения пустой строки вместо None, если элемент отсутствует
+             contact_person_raw = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').get('')
+             item['contactname'] = contact_person_raw.strip() or None
+
              company_text_lines = contacts_block.xpath('.//div[contains(@class, "dit")]/div[contains(@class, "mb10")]/text()').getall()
-             company_org_name = None
+             company_org_name_raw = None
              for line in company_text_lines:
                  if 'Агентство недвижимости:' in line:
-                     company_org_name = line.replace('Агентство недвижимости:', '').strip()
+                     company_org_name_raw = line.replace('Агентство недвижимости:', '').strip()
                      break
 
-             if company_org_name:
+             item['company'] = company_org_name_raw.strip() if company_org_name_raw else None
+             if item['company']: # Если компания есть, то это компания
                   item['is_company'] = True
-                  item['company'] = company_org_name or None
-                  if item['contactname'] is None:
-                       item['contactname'] = company_org_name or None
-             elif item['contactname']: 
+                  if item['contactname'] is None: # если имя контакта не было найдено, используем имя компании
+                       item['contactname'] = item['company']
+             elif item['contactname']: # Если компания не найдена, но есть контакт, то это физлицо
                  item['is_company'] = False
 
              # Сбор телефонов
@@ -298,7 +284,7 @@ class NmlsSpider(scrapy.Spider):
             if len(parts) > 1:
                  item['city'] = parts[0]
                  item['region'] = parts[-1]
-            elif parts:
+            elif parts: # если остался только один элемент
                  item['city'] = parts[0]
                  item['region'] = parts[0]
 
@@ -337,7 +323,7 @@ class NmlsSpider(scrapy.Spider):
             item['lat'] = float(lat_text) if lat_text else None
             item['lon'] = float(lon_text) if lon_text else None
         except (ValueError, TypeError):
-             self.logger.warning(f"координаты ({lat_text}, {lon_text}) не число для {response.url}")
+             self.logger.warning(f"координаты ({lat_text}, {lon_text}) не являются числом для {response.url}")
              item['lat'] = None
              item['lon'] = None
 
@@ -357,16 +343,15 @@ class NmlsSpider(scrapy.Spider):
 
             key = k_text.strip()
 
-            if key == 'Адрес':
+            if key == 'Адрес': # Адрес уже парсится отдельно
                 continue 
 
             v_parts = v_td.xpath(".//text()").getall()
             value = " ".join([_.strip() for _ in v_parts if _.strip()]).strip()
-            value = re.sub(r'\s*–.*', '', value).strip() 
+            value = re.sub(r'\s*–.*', '', value).strip() # Удаление суффиксов типа "– всего"
             value = re.sub(r'\s+', ' ', value).strip()   
 
             params_data[key] = value or None 
-
 
         item['params'] = json.dumps(params_data, ensure_ascii=False)
 
@@ -378,7 +363,7 @@ class NmlsSpider(scrapy.Spider):
 
         item['date_posted'] = parse_date_string(date_text, logger=self.logger)
 
-        #   инкрементируем общие счетчики и счетчики по регионам/городам
+        # инкрементируем общие счетчики и счетчики по регионам/городам
         self.crawler.stats.inc_value('total_items_scraped')
         if item['region']:
             # используем item['region'] для более точной статистики по регионам, чем domain
@@ -408,7 +393,7 @@ class NmlsSpider(scrapy.Spider):
                  try:
                       phone_item['phone'] = int(phone_digits)
                  except ValueError:
-                      self.logger.warning(f"телефон '{phone_digits}' не int для {response.url}")
+                      self.logger.warning(f"телефон '{phone_digits}' не является int для {response.url}")
                       continue
                  phone_item['is_fake'] = False
                  phone_item['date_update'] = datetime.datetime.now()
